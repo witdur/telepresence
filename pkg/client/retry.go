@@ -44,6 +44,7 @@ func Retry(c context.Context, text string, f func(context.Context) error, durati
 	}
 
 	if maxTime > 0 {
+		dlog.Debugf(c, "creating cancel after timeout %d", maxTime)
 		var cancel context.CancelFunc
 		c, cancel = context.WithTimeout(c, maxTime)
 		defer cancel()
@@ -57,12 +58,15 @@ func Retry(c context.Context, text string, f func(context.Context) error, durati
 		}
 
 		// Logging at higher log levels should be done in the called function
-		dlog.Debugf(c, "%s waiting %s before retrying after error: %v", text, delay.String(), err)
+		dlog.Debugf(c, "%s: waiting %s before retrying", text, delay.String())
+		err = nil
 
 		select {
 		case <-c.Done():
 			if c.Err() == context.DeadlineExceeded {
 				err = fmt.Errorf("retry timed out after: %s", maxTime.String())
+			} else {
+				err = c.Err()
 			}
 			return err
 		case <-time.After(delay):

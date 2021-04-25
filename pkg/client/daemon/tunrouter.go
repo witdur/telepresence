@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/datawire/dlib/dtime"
+
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
@@ -95,6 +97,10 @@ type tunRouter struct {
 	// mgrConfigured will be closed as soon as the connector has sent over the correct port to
 	// the traffic manager and the managerClient has been connected.
 	mgrConfigured <-chan struct{}
+
+	// cancelInnerRun cancels the current run but doesn't stop the router (i.e. connections aren't killed)
+	// it is used for restarts when the connection to the traffic-manager is dropped
+	cancelInnerRun context.CancelFunc
 }
 
 func newTunRouter(managerConfigured <-chan struct{}) (*tunRouter, error) {
@@ -118,23 +124,28 @@ func (t *tunRouter) configureDNS(_ context.Context, dnsIP net.IP, dnsPort uint16
 	return nil
 }
 
+func connectTrafficManager(ctx context.Context, mi *daemon.OutboundInfo) (manager.ManagerClient, error) {
+	tos := &client.GetConfig(ctx).Timeouts
+	tc, cancel := context.WithTimeout(ctx, tos.TrafficManagerAPI)
+	defer cancel()
+
+	conn, err := grpc.DialContext(tc, fmt.Sprintf("127.0.0.1:%d", mi.ManagerPort),
+		grpc.WithInsecure(),
+		grpc.WithNoProxy(),
+		grpc.WithBlock())
+	if err != nil {
+		return nil, client.CheckTimeout(tc, &tos.TrafficManagerAPI, err)
+	}
+	return manager.NewManagerClient(conn), nil
+}
+
 func (t *tunRouter) setOutboundInfo(ctx context.Context, mi *daemon.OutboundInfo) (err error) {
 	if t.managerClient == nil {
 		// First check. Establish connection
-		tos := &client.GetConfig(ctx).Timeouts
-		tc, cancel := context.WithTimeout(ctx, tos.TrafficManagerAPI)
-		defer cancel()
-
-		var conn *grpc.ClientConn
-		conn, err = grpc.DialContext(tc, fmt.Sprintf("127.0.0.1:%d", mi.ManagerPort),
-			grpc.WithInsecure(),
-			grpc.WithNoProxy(),
-			grpc.WithBlock())
-		if err != nil {
-			return client.CheckTimeout(tc, &tos.TrafficManagerAPI, err)
+		if t.managerClient, err = connectTrafficManager(ctx, mi); err != nil {
+			return err
 		}
 		t.session = mi.Session
-		t.managerClient = manager.NewManagerClient(conn)
 
 		cidr := iputil.IPNetFromRPC(mi.ServiceSubnet)
 		dlog.Infof(ctx, "Adding service subnet %s", cidr)
@@ -149,6 +160,14 @@ func (t *tunRouter) setOutboundInfo(ctx context.Context, mi *daemon.OutboundInfo
 				return err
 			}
 		}
+	} else {
+		// This is due to a reconnect. Reset the managerClient and  ensure that a new innerRun is started
+		dlog.Debugf(ctx, "reconnecting traffic manager at %d", mi.ManagerPort)
+		if t.managerClient, err = connectTrafficManager(ctx, mi); err != nil {
+			return err
+		}
+		dlog.Debug(ctx, "cancelling inner run")
+		t.cancelInnerRun()
 	}
 	return nil
 }
@@ -173,54 +192,7 @@ var blockedUDPPorts = map[uint16]bool{
 }
 
 func (t *tunRouter) run(c context.Context) error {
-	g := dgroup.NewGroup(c, dgroup.GroupConfig{})
-
-	// writer
-	g.Go("TUN writer", func(c context.Context) error {
-		for atomic.LoadInt32(&t.closing) < 2 {
-			select {
-			case <-c.Done():
-				return nil
-			case pkt := <-t.toTunCh:
-				dlog.Debugf(c, "-> TUN %s", pkt)
-				_, err := t.dev.Write(pkt.Data())
-				pkt.SoftRelease()
-				if err != nil {
-					if atomic.LoadInt32(&t.closing) == 2 || c.Err() != nil {
-						err = nil
-					}
-					return err
-				}
-			}
-		}
-		return nil
-	})
-
-	g.Go("MGR stream", func(c context.Context) error {
-		dlog.Debug(c, "Waiting until manager gRPC is configured")
-		select {
-		case <-c.Done():
-			return nil
-		case <-t.mgrConfigured:
-		}
-
-		jsonSessionID, err := json.Marshal(t.session)
-		if err != nil {
-			return err
-		}
-		tunnel, err := t.managerClient.ConnTunnel(c)
-		if err != nil {
-			return err
-		}
-		if err = tunnel.Send(connpool.ConnControl("", connpool.SessionID, jsonSessionID)); err != nil {
-			return err
-		}
-		t.connStream = connpool.NewStream(tunnel, t.handlers)
-		dlog.Debug(c, "MGR read loop starting")
-		return t.connStream.ReadLoop(c, &t.closing)
-	})
-
-	g.Go("TUN reader", func(c context.Context) error {
+	dgroup.ParentGroup(c).Go("TUN reader", func(c context.Context) error {
 		dlog.Debug(c, "Waiting until manager gRPC is configured")
 		select {
 		case <-c.Done():
@@ -248,6 +220,81 @@ func (t *tunRouter) run(c context.Context) error {
 			t.handlePacket(c, data)
 		}
 		return nil
+	})
+
+	for retry := 0; ; retry++ {
+		select {
+		case <-c.Done():
+			return nil
+		default:
+			err := t.innerRun(c, retry)
+			if err != nil {
+				dlog.Error(c, err)
+			}
+			dtime.SleepWithContext(c, 2*time.Second)
+		}
+	}
+}
+
+func (t *tunRouter) innerRun(c context.Context, retry int) error {
+	c, t.cancelInnerRun = context.WithCancel(c)
+	g := dgroup.NewGroup(c, dgroup.GroupConfig{})
+
+	defer dlog.Debug(c, "Ending inner run %d", retry)
+	dlog.Debug(c, "Starting inner run %d", retry)
+
+	// writer
+	g.Go(fmt.Sprintf("TUN writer %d", retry), func(c context.Context) error {
+		for atomic.LoadInt32(&t.closing) < 2 {
+			select {
+			case <-c.Done():
+				return nil
+			case pkt := <-t.toTunCh:
+				dlog.Debugf(c, "-> TUN %s", pkt)
+				_, err := t.dev.Write(pkt.Data())
+				pkt.SoftRelease()
+				if err != nil {
+					if atomic.LoadInt32(&t.closing) == 2 || c.Err() != nil {
+						err = nil
+					}
+					return err
+				}
+			}
+		}
+		return nil
+	})
+
+	g.Go(fmt.Sprintf("MGR stream %d", retry), func(c context.Context) error {
+		dlog.Debug(c, "Waiting until manager gRPC is configured")
+		select {
+		case <-c.Done():
+			return nil
+		case <-t.mgrConfigured:
+		}
+
+		jsonSessionID, err := json.Marshal(t.session)
+		if err != nil {
+			return err
+		}
+		tunnel, err := t.managerClient.ConnTunnel(c)
+		if err != nil {
+			return err
+		}
+		go func() {
+			<-c.Done()
+			_ = tunnel.CloseSend()
+		}()
+
+		if err = tunnel.Send(connpool.ConnControl("", connpool.SessionID, jsonSessionID)); err != nil {
+			return err
+		}
+		if t.connStream == nil {
+			t.connStream = connpool.NewStream(tunnel, t.handlers)
+		} else {
+			t.connStream.ConnTunnelStream = tunnel
+		}
+		dlog.Debug(c, "MGR read loop starting")
+		return t.connStream.ReadLoop(c, &t.closing)
 	})
 	return g.Wait()
 }

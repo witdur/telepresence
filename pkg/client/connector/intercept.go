@@ -453,7 +453,11 @@ func (tm *trafficManager) removeLocalOnlyIntercept(c context.Context, name, name
 
 // clearIntercepts removes all intercepts
 func (tm *trafficManager) clearIntercepts(c context.Context) error {
-	intercepts, _ := actions.ListMyIntercepts(c, tm.managerClient, tm.session().SessionId)
+	client := tm.managerClient
+	if client == nil {
+		return nil
+	}
+	intercepts, _ := actions.ListMyIntercepts(c, client, tm.session().SessionId)
 	for _, cept := range intercepts {
 		err := tm.removeIntercept(c, cept.Spec.Name)
 		if err != nil {

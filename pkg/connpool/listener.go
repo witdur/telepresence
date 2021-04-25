@@ -32,6 +32,8 @@ func (h *listener) Start(ctx context.Context) {
 	dlog.Infof(ctx, "Started %s listener at %s", h.id.ProtocolString(), h.listener.Addr())
 }
 
+func (h *listener) ResetStream(_ ConnTunnelStream) {}
+
 func (h *listener) Close(ctx context.Context) {
 	if h.listener != nil {
 		_ = h.listener.Close()

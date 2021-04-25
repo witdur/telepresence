@@ -217,14 +217,18 @@ func (o *outbound) resolveInCluster(c context.Context, qType uint16, query strin
 }
 
 func (o *outbound) setInfo(c context.Context, info *rpc.OutboundInfo) error {
-	defer o.closeManagerConfigured.Do(func() {
-		close(o.managerConfigured)
-	})
-	if err := o.router.setOutboundInfo(c, info); err != nil {
-		return err
+	if o.managerConfigured != nil {
+		defer func() {
+			close(o.managerConfigured)
+			o.managerConfigured = nil
+		}()
+		if err := o.router.setOutboundInfo(c, info); err != nil {
+			return err
+		}
+		o.kubeDNS <- info.KubeDnsIp
+		return nil
 	}
-	o.kubeDNS <- info.KubeDnsIp
-	return nil
+	return o.router.setOutboundInfo(c, info)
 }
 
 func (o *outbound) noMoreUpdates() {

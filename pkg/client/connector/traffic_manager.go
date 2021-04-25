@@ -9,9 +9,12 @@ import (
 	"os/user"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/datawire/dlib/dexec"
+	"github.com/datawire/dlib/dtime"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
@@ -47,8 +50,16 @@ type trafficManager struct {
 
 	sessionInfo *manager.SessionInfo // sessionInfo returned by the traffic-manager
 
+	// grpcPort is the local TCP port number that gets forwarded to the port that where the
+	// manager pod exposes the gRPC API.
+	grpcPort int32
+
 	// Map of desired mount points for intercepts
 	mountPoints sync.Map
+
+	// outboundInfo is the information that is sent to the daemon when a new connection to the
+	// traffic-manager gRPC has been initially established or when a reconnect has been made.
+	outboundInfo *daemon.OutboundInfo
 }
 
 // newTrafficManager returns a TrafficManager resource for the given
@@ -102,42 +113,225 @@ func (tm *trafficManager) run(c context.Context) error {
 		close(tm.startup)
 		return err
 	}
+	return client.Retry(c, "svc/traffic-manager port-forward", tm.portForward, 2*time.Second, 6*time.Second)
+}
 
-	kpfArgs := []string{
-		"--namespace",
-		managerNamespace,
-		"svc/traffic-manager",
-		fmt.Sprintf(":%d", ManagerPortHTTP)}
+var pfErrRx = regexp.MustCompile(`\AE\d.*]\s*(.*)\z`)
 
-	// Scan port-forward output and grab the dynamically allocated ports
-	rxPortForward := regexp.MustCompile(`\AForwarding from \d+\.\d+\.\d+\.\d+:(\d+) -> (\d+)`)
-	outputScanner := func(sc *bufio.Scanner) interface{} {
+// portForward starts a kubectl port-forward command and scans its output for a "Forwarding from" message.
+// When it arrives, the port is used in a call to trafficManager.connectGrpc() of the traffic manager and
+// if that succeeds, it is followed by a new call to the trafficManager.innerRun() function.
+func (tm *trafficManager) portForward(c context.Context) error {
+	var portArg string
+	if tm.grpcPort > 0 {
+		portArg = fmt.Sprintf("%d:%d", tm.grpcPort, ManagerPortHTTP)
+	} else {
+		portArg = fmt.Sprintf(":%d", ManagerPortHTTP)
+	}
+	args := make([]string, 0, len(tm.flagArgs)+5)
+	args = append(args, tm.flagArgs...)
+	args = append(args, "port-forward", "--namespace", managerNamespace, "svc/traffic-manager", portArg)
+
+	pfCtx, pfCancel := context.WithCancel(c)
+	defer pfCancel()
+
+	pf := dexec.CommandContext(pfCtx, "kubectl", args...)
+	pfOut, err := pf.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	defer pfOut.Close()
+	pfErr, err := pf.StderrPipe()
+	if err != nil {
+		return err
+	}
+	defer pfErr.Close()
+
+	// We want this command to keep on running. If it returns an error, then it was unsuccessful.
+	if err = pf.Start(); err != nil {
+		pfOut.Close()
+		dlog.Errorf(c, "port-forward failed to start: %v", client.RunError(err))
+		return err
+	}
+
+	// Give port-forward at least the port-forward timeout to produce the correct output and spawn the next process.
+	// The timer is stopped as soon as the port-forward succeeds
+	toc := client.GetConfig(c).Timeouts
+	timer := time.AfterFunc(toc.TrafficManagerConnect, func() {
+		pfCancel()
+	})
+
+	grpcPortCh := make(chan int)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sc := bufio.NewScanner(pfOut)
+		rxPortForward := regexp.MustCompile(`\AForwarding from \d+\.\d+\.\d+\.\d+:(\d+) -> (\d+)`)
 		for sc.Scan() {
 			if rxr := rxPortForward.FindStringSubmatch(sc.Text()); rxr != nil {
+				fromPort, _ := strconv.Atoi(rxr[1])
 				toPort, _ := strconv.Atoi(rxr[2])
 				if toPort == ManagerPortHTTP {
-					apiPort := rxr[1]
-					dlog.Debugf(c, "traffic-manager api-port %s", apiPort)
-					return apiPort
+					// A retry must use the same port
+					grpcPortCh <- fromPort
+					for sc.Scan() {
+						// Consume and toss further output
+					}
+					break
 				}
 			}
 		}
-		return nil
-	}
+	}()
 
-	return client.Retry(c, "svc/traffic-manager port-forward", func(c context.Context) error {
-		return tm.portForwardAndThen(c, kpfArgs, outputScanner, tm.initGrpc)
-	}, 2*time.Second, 6*time.Second)
+	// An error channel receives all errors until pfc is done or errCh closes
+	errCh := make(chan error)
+	var errs []error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-pfCtx.Done():
+				return
+			case err := <-errCh:
+				errs = append(errs, err)
+			}
+		}
+	}()
+
+	// kubectl port-forward exits with zero although errors are caught during the run
+	// so those errors must be captured from stderr and dealt with.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sc := bufio.NewScanner(pfErr)
+		for sc.Scan() {
+			txt := strings.TrimSpace(sc.Text())
+			if errTxt := pfErrRx.FindStringSubmatch(txt); errTxt != nil {
+				errCh <- errors.New(errTxt[1])
+				close(grpcPortCh)
+				pfCancel()
+				break
+			}
+		}
+	}()
+
+	// wait for the grpcPort to arrive. When it does, make an attempt to connect to the
+	// gRPC API. If it succeeds, stop the timer and call trafficManager.innerRun()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		grpcPort := <-grpcPortCh
+		if grpcPort == 0 {
+			return
+		}
+
+		// Retry a call to connect the gRPC. It shouldn't fail but the port forward isn't
+		// always complete although the output seems to indicate that it is. So one retry is
+		// motivated.
+		tos := &client.GetConfig(c).Timeouts
+		// An initial sleep of at least one second is needed for the port forward to become
+		// effective. Without this, the first connect attempt will always fail.
+		dtime.SleepWithContext(pfCtx, time.Second)
+
+		var err error
+		for retry := 0; ; {
+			tc, tCancel := context.WithTimeout(pfCtx, toc.TrafficManagerAPI)
+			err = tm.connectGrpc(tc, grpcPort)
+			tCancel()
+			if err == nil {
+				timer.Stop()
+				break
+			}
+			if pfCtx.Err() != nil {
+				// Parent cancelled, nothing left to do then.
+				err = nil
+				return
+			}
+			retry++
+			if retry == 2 {
+				errCh <- client.CheckTimeout(tc, &tos.TrafficManagerAPI, err)
+				return
+			}
+		}
+
+		go func() {
+			// Call start unless already started (which will be the case when this restart is due to
+			// lossy connection).
+			if tm.startup != nil {
+				err := tm.innerRun(c)
+				pfCancel()
+				if err != nil {
+					dlog.Error(c, err)
+				}
+			} else {
+				// Tell the daemon that a reconnect was made. It must reset it's manager client.
+				dlog.Debug(c, "Sending new outbound info to daemon")
+				if _, err := tm.daemon.SetOutboundInfo(c, tm.outboundInfo); err != nil {
+					dlog.Error(c, err)
+				}
+			}
+		}()
+	}()
+
+	// let the port forward continue running. It will either be killed by the
+	// timer (if it didn't produce the expected output) or by a context cancel.
+	if err = pf.Wait(); err != nil {
+		if pfCtx.Err() == nil {
+			errCh <- err
+		}
+	}
+	pfCancel()
+	wg.Wait()
+
+	switch len(errs) {
+	case 0:
+	case 1:
+		err = errs[0]
+	default:
+		sb := strings.Builder{}
+		sb.WriteString(errs[0].Error())
+		for _, err = range errs[1:] {
+			sb.WriteString(", ")
+			sb.WriteString(err.Error())
+		}
+		err = errors.New(sb.String())
+	}
+	return err
 }
 
-func (tm *trafficManager) initGrpc(c context.Context, portIf interface{}) (err error) {
-	grpcPort, _ := strconv.Atoi(portIf.(string))
+func (tm *trafficManager) connectGrpc(c context.Context, grpcPort int) error {
+	tm.grpcPort = int32(grpcPort)
 
 	// First check. Establish connection
-	tos := &client.GetConfig(c).Timeouts
-	tc, cancel := context.WithTimeout(c, tos.TrafficManagerAPI)
-	defer cancel()
+	conn, err := grpc.DialContext(c, fmt.Sprintf("127.0.0.1:%d", grpcPort),
+		grpc.WithInsecure(),
+		grpc.WithNoProxy(),
+		grpc.WithBlock())
+	if err != nil {
+		return err
+	}
 
+	mClient := manager.NewManagerClient(conn)
+	if tm.sessionInfo == nil {
+		tm.sessionInfo, err = mClient.ArriveAsClient(c, &manager.ClientInfo{
+			Name:      tm.userAndHost,
+			InstallId: tm.installID,
+			Product:   "telepresence",
+			Version:   client.Version(),
+			ApiKey:    func() string { tok, _ := tm.getAPIKey(c, "manager", false); return tok }(),
+		})
+		if err != nil {
+			conn.Close()
+			return err
+		}
+	}
+	tm.managerClient = mClient
+	return nil
+}
+
+func (tm *trafficManager) innerRun(c context.Context) (err error) {
 	var conn *grpc.ClientConn
 	defer func() {
 		if err != nil {
@@ -148,39 +342,17 @@ func (tm *trafficManager) initGrpc(c context.Context, portIf interface{}) (err e
 			}
 			if tm.startup != nil {
 				close(tm.startup)
+				tm.startup = nil
 			}
 		}
 	}()
 
-	conn, err = grpc.DialContext(tc, fmt.Sprintf("127.0.0.1:%d", grpcPort),
-		grpc.WithInsecure(),
-		grpc.WithNoProxy(),
-		grpc.WithBlock())
-	if err != nil {
-		return client.CheckTimeout(tc, &tos.TrafficManagerAPI, err)
-	}
-
-	mClient := manager.NewManagerClient(conn)
-	si, err := mClient.ArriveAsClient(tc, &manager.ClientInfo{
-		Name:      tm.userAndHost,
-		InstallId: tm.installID,
-		Product:   "telepresence",
-		Version:   client.Version(),
-		ApiKey:    func() string { tok, _ := tm.getAPIKey(c, "manager", false); return tok }(),
-	})
-
-	if err != nil {
-		return client.CheckTimeout(tc, &tos.TrafficManagerAPI, fmt.Errorf("ArriveAsClient: %w", err))
-	}
-	tm.managerClient = mClient
-	tm.sessionInfo = si
-
 	// Tell daemon what it needs to know in order to establish outbound traffic to the cluster
-	outboundInfo, err := tm.getOutboundInfo(c, int32(grpcPort))
+	tm.outboundInfo, err = tm.getOutboundInfo(c)
 	if err != nil {
 		return err
 	}
-	if _, err = tm.daemon.SetOutboundInfo(c, outboundInfo); err != nil {
+	if _, err = tm.daemon.SetOutboundInfo(c, tm.outboundInfo); err != nil {
 		return err
 	}
 
@@ -401,6 +573,9 @@ func (tm *trafficManager) workloadInfoSnapshot(ctx context.Context, rq *rpc.List
 }
 
 func (tm *trafficManager) remain(c context.Context) error {
+	defer func() {
+		tm.managerClient = nil
+	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -415,10 +590,11 @@ func (tm *trafficManager) remain(c context.Context) error {
 				ApiKey:  func() string { tok, _ := tm.getAPIKey(c, "manager", false); return tok }(),
 			})
 			if err != nil {
-				if c.Err() != nil {
-					err = nil
+				if c.Err() == nil {
+					dlog.Error(c, err)
+					continue
 				}
-				return err
+				return nil
 			}
 		}
 	}
@@ -515,7 +691,7 @@ func (tm *trafficManager) uninstall(c context.Context, ur *rpc.UninstallRequest)
 var svcCIDRrx = regexp.MustCompile(`range of valid IPs is (.*)$`)
 
 // getClusterCIDRs finds the service CIDR and the pod CIDRs of all nodes in the cluster
-func (tm *trafficManager) getOutboundInfo(c context.Context, mgrPort int32) (*daemon.OutboundInfo, error) {
+func (tm *trafficManager) getOutboundInfo(c context.Context) (*daemon.OutboundInfo, error) {
 	// Get all nodes
 	var nodes []kates.Node
 	var cidr *net.IPNet
@@ -596,7 +772,7 @@ func (tm *trafficManager) getOutboundInfo(c context.Context, mgrPort int32) (*da
 
 	return &daemon.OutboundInfo{
 		Session:       tm.sessionInfo,
-		ManagerPort:   mgrPort,
+		ManagerPort:   tm.grpcPort,
 		KubeDnsIp:     kubeDNS,
 		ServiceSubnet: serviceSubnet,
 		PodSubnets:    podCIDRs,
