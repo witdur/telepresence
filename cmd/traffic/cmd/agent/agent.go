@@ -162,17 +162,25 @@ func Main(ctx context.Context, args ...string) error {
 
 	sftpPort := uint16(0)
 	if hasMounts && user == "" {
-		// start an sftp-server for remote sshfs mounts
-		l, err := net.Listen("tcp4", ":0")
-		if err != nil {
-			return err
-		}
-		if _, sftpPort, err = iputil.SplitToIPPort(l.Addr()); err != nil {
-			return err
-		}
-		defer l.Close()
-
 		g.Go("sftp-server", func(ctx context.Context) error {
+			// start an sftp-server for remote sshfs mounts
+			lc := net.ListenConfig{}
+			l, err := lc.Listen(ctx, "tcp4", ":0")
+			if err != nil {
+				return err
+			}
+
+			// Accept doesn't actually return when the context is cancelled so
+			// it's explicitly closed here.
+			go func() {
+				<-ctx.Done()
+				_ = l.Close()
+			}()
+
+			if _, sftpPort, err = iputil.SplitToIPPort(l.Addr()); err != nil {
+				return err
+			}
+
 			for {
 				conn, err := l.Accept()
 				if err != nil {
