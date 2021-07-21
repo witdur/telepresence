@@ -21,9 +21,9 @@ import (
 
 const kubernetesZone = "cluster.local"
 
-type awaitLookupResult struct {
-	done   chan struct{}
-	result iputil.IPs
+type dnsKey struct {
+	query string
+	qType uint16
 }
 
 // outbound does stuff, idk, I didn't write it.
@@ -55,9 +55,9 @@ type outbound struct {
 
 	work chan func(context.Context) error
 
-	// dnsQueriesInProgress unique set of DNS queries currently in progress.
-	dnsInProgress  map[string]*awaitLookupResult
-	dnsQueriesLock sync.Mutex
+	// dnsRecursion unique set of DNS queries currently in progress.
+	dnsRecursion     map[dnsKey]*int
+	dnsRecursionLock sync.Mutex
 
 	dnsConfig *rpc.DNSConfig
 }
@@ -93,7 +93,7 @@ func newOutbound(c context.Context, dnsIPStr string, noSearch bool) (*outbound, 
 		noSearch:      noSearch,
 		namespaces:    make(map[string]struct{}),
 		domains:       make(map[string]struct{}),
-		dnsInProgress: make(map[string]*awaitLookupResult),
+		dnsRecursion:  make(map[dnsKey]*int),
 		search:        []string{""},
 		work:          make(chan func(context.Context) error),
 		dnsConfigured: make(chan struct{}),
@@ -160,6 +160,12 @@ func (o *outbound) shouldDoClusterLookup(query string) bool {
 	return true
 }
 
+// The maximum number of queries for the exact same name during resolution of that name
+// before the resolveInCluster() gives up and returns nil. This is a best effort since
+// there's no way to know if the query actually is a recursion or if it's simultaneously
+// made by several clients at the same time.
+const maxRecursion = 3
+
 func (o *outbound) resolveInCluster(c context.Context, qType uint16, query string) []net.IP {
 	query = strings.ToLower(query)
 	query = strings.TrimSuffix(query, tel2SubDomainDot)
@@ -182,33 +188,32 @@ func (o *outbound) resolveInCluster(c context.Context, qType uint16, query strin
 		return nil
 	}
 
-	var firstLookupResult *awaitLookupResult
-	o.dnsQueriesLock.Lock()
-	awaitResult := o.dnsInProgress[query]
-	if awaitResult == nil {
-		firstLookupResult = &awaitLookupResult{done: make(chan struct{})}
-		o.dnsInProgress[query] = firstLookupResult
-	}
-	o.dnsQueriesLock.Unlock()
-
-	if awaitResult != nil {
-		// Wait for this query to complete. Then return its value
-		select {
-		case <-awaitResult.done:
-			return awaitResult.result
-		case <-c.Done():
+	key := dnsKey{query, qType}
+	o.dnsRecursionLock.Lock()
+	recursion := o.dnsRecursion[key]
+	if recursion == nil {
+		r := 1
+		recursion = &r
+		o.dnsRecursion[key] = recursion
+	} else {
+		if *recursion+1 >= maxRecursion {
+			o.dnsRecursionLock.Unlock()
 			return nil
 		}
+		*recursion++
 	}
+	o.dnsRecursionLock.Unlock()
 
 	// Give the cluster lookup a reasonable timeout.
 	c, cancel := context.WithTimeout(c, o.dnsConfig.LookupTimeout.AsDuration())
 	defer func() {
 		cancel()
-		o.dnsQueriesLock.Lock()
-		delete(o.dnsInProgress, query)
-		o.dnsQueriesLock.Unlock()
-		close(firstLookupResult.done)
+		o.dnsRecursionLock.Lock()
+		*recursion--
+		if *recursion == 0 {
+			delete(o.dnsRecursion, key)
+		}
+		o.dnsRecursionLock.Unlock()
 	}()
 
 	queryWithNoTrailingDot := query[:len(query)-1]
@@ -228,7 +233,6 @@ func (o *outbound) resolveInCluster(c context.Context, qType uint16, query strin
 	for i, ip := range response.Ips {
 		ips[i] = ip
 	}
-	firstLookupResult.result = ips
 	return ips
 }
 
