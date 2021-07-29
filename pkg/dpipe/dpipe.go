@@ -11,7 +11,10 @@ import (
 	"github.com/datawire/dlib/dlog"
 )
 
-func DPipe(ctx context.Context, cmd *dexec.Cmd, peer io.ReadWriteCloser) error {
+func DPipe(pCtx context.Context, peer io.ReadWriteCloser, cmdName string, cmdArgs ...string) error {
+	ctx, cancel := context.WithCancel(pCtx)
+	defer cancel()
+	cmd := dexec.CommandContext(ctx, cmdName, cmdArgs...)
 	cmdOut, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to establish stdout pipe: %w", err)
@@ -42,16 +45,23 @@ func DPipe(ctx context.Context, cmd *dexec.Cmd, peer io.ReadWriteCloser) error {
 	go func() {
 		if _, err := io.Copy(cmdIn, peer); err != nil && atomic.LoadInt32(&closing) == 0 {
 			dlog.Errorf(ctx, "copy from sftp-server to connection failed: %v", err)
+			// If copying stuff in from the peer has failed, it makes no sense to keep hanging on to the dead connection. Cancel everything.
+			cancel()
 		}
 	}()
 
 	go func() {
 		if _, err := io.Copy(peer, cmdOut); err != nil && atomic.LoadInt32(&closing) == 0 {
 			dlog.Errorf(ctx, "copy from connection to sftp-server failed: %v", err)
+			cancel()
 		}
 	}()
 	if err = cmd.Wait(); err != nil && atomic.LoadInt32(&closing) == 0 {
 		return fmt.Errorf("execution failed: %w", err)
+	}
+	if pCtx.Err() == nil {
+		// If the parent context is still live, the command must have been killed by an io.Copy failure
+		return fmt.Errorf("command %s terminated abnormally: %w", cmdName, ctx.Err())
 	}
 	return nil
 }

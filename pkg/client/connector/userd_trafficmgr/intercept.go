@@ -11,7 +11,6 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/datawire/dlib/dexec"
 	"github.com/datawire/dlib/dgroup"
 	"github.com/datawire/dlib/dlog"
 	"github.com/datawire/dlib/dtime"
@@ -451,7 +450,7 @@ func (tm *trafficManager) workerMountForwardIntercept(ctx context.Context, mf mo
 			sshfsArgs = append([]string{"cmd", "-ouid=-1", "-ogid=-1"}, sshfsArgs...)
 			exe = "sshfs-win"
 		}
-		return dpipe.DPipe(ctx, dexec.CommandContext(ctx, exe, sshfsArgs...), conn)
+		return dpipe.DPipe(ctx, conn, exe, sshfsArgs...)
 	}, 3*time.Second, 6*time.Second)
 
 	if err != nil && ctx.Err() == nil {
