@@ -71,18 +71,14 @@ func terminateProcess(ctx context.Context, exe string, pid uint32, pes []*proces
 	if err = windows.TerminateProcess(h, 0); err != nil {
 		// An ACCESS_DENIED error may indicate that the process is dead already but
 		// died just after the handle to it was opened.
-		alreadyDead := false
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			alive, aliveErr := processIsAlive(pid)
-			if aliveErr != nil {
-				dlog.Error(ctx, err)
-			} else {
-				alreadyDead = !alive
+			if alive, aliveErr := processIsAlive(pid); aliveErr != nil {
+				dlog.Error(ctx, aliveErr)
+			} else if !alive {
+				return nil
 			}
 		}
-		if !alreadyDead {
-			return fmt.Errorf("failed to terminate %q: %w", exe, err)
-		}
+		return fmt.Errorf("failed to terminate %q: %w", exe, err)
 	}
 	dlog.Infof(ctx, "terminated process %q (pid %d)", exe, pid)
 	return nil

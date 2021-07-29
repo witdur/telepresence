@@ -7,28 +7,22 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
+
 	"github.com/datawire/dlib/dexec"
 	"github.com/datawire/dlib/dlog"
 )
 
-func DPipe(pCtx context.Context, peer io.ReadWriteCloser, cmdName string, cmdArgs ...string) error {
-	ctx, cancel := context.WithCancel(pCtx)
-	defer cancel()
+func DPipe(ctx context.Context, peer io.ReadWriteCloser, cmdName string, cmdArgs ...string) error {
 	cmd := dexec.CommandContext(ctx, cmdName, cmdArgs...)
-	cmdOut, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to establish stdout pipe: %w", err)
-	}
-	defer cmdOut.Close()
+	cmd.Stdin = peer
+	cmd.Stdout = peer
+	cmd.Stderr = io.Discard   // Ensure error logging by passing a non nil, non *os.File here
+	cmd.DisableLogging = true // Avoid data logging (peer is not a *os.File)
 
-	cmdIn, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to establish stdin pipe: %w", err)
-	}
-	defer cmdIn.Close()
-
-	if err = cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start: %w", err)
+	cmdLine := logging.ShellString(cmd.Path, cmd.Args)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start %s: %w", cmdLine, err)
 	}
 
 	var killTimer *time.Timer
@@ -42,26 +36,23 @@ func DPipe(pCtx context.Context, peer io.ReadWriteCloser, cmdName string, cmdArg
 
 	go waitCloseAndKill(ctx, cmd, peer, &closing, &killTimer)
 
-	go func() {
-		if _, err := io.Copy(cmdIn, peer); err != nil && atomic.LoadInt32(&closing) == 0 {
-			dlog.Errorf(ctx, "copy from sftp-server to connection failed: %v", err)
-			// If copying stuff in from the peer has failed, it makes no sense to keep hanging on to the dead connection. Cancel everything.
-			cancel()
+	ctx = dlog.WithField(ctx, "dexec.pid", cmd.Process.Pid)
+	dlog.Infof(ctx, "started command %s", cmdLine)
+	err := cmd.Wait()
+	how := "successfully"
+	if err != nil {
+		if cmd.ProcessState.Success() {
+			// Error is most likely "use of closed connection", which is normal for pipes
+			dlog.Debugf(ctx, "normal exit caused by: %v", err)
+			err = nil
+		} else if ctx.Err() != nil {
+			how = "by cancellation"
+			err = nil
 		}
-	}()
-
-	go func() {
-		if _, err := io.Copy(peer, cmdOut); err != nil && atomic.LoadInt32(&closing) == 0 {
-			dlog.Errorf(ctx, "copy from connection to sftp-server failed: %v", err)
-			cancel()
-		}
-	}()
-	if err = cmd.Wait(); err != nil && atomic.LoadInt32(&closing) == 0 {
-		return fmt.Errorf("execution failed: %w", err)
 	}
-	if pCtx.Err() == nil {
-		// If the parent context is still live, the command must have been killed by an io.Copy failure
-		return fmt.Errorf("command %s terminated abnormally: %w", cmdName, ctx.Err())
+	if err != nil {
+		how = "with error"
 	}
-	return nil
+	dlog.Infof(ctx, "finished %s: %v", how, cmd.ProcessState)
+	return err
 }
