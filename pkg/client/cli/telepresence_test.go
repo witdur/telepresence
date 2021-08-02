@@ -2,8 +2,10 @@ package cli_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -120,6 +122,13 @@ func (ts *telepresenceSuite) SetupSuite() {
 			ts.NoError(err)
 		}()
 	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err = ts.applyHttpbinService(ctx, "httpbin")
+		ts.NoError(err)
+	}()
 
 	wg.Add(1)
 	go func() {
@@ -741,6 +750,24 @@ func (cs *connectedSuite) TestN_ToPodPortForwarding() {
 	})
 }
 
+func (cs *connectedSuite) TestO_LargeRequest() {
+	client := &http.Client{}
+	b := make([]byte, 1024*1024*8)
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://httpbin.%s/put", cs.ns()), bytes.NewBuffer(b))
+	cs.NoError(err)
+
+	resp, err := client.Do(req)
+	cs.NoError(err)
+	defer resp.Body.Close()
+	cs.Equal(resp.StatusCode, 200)
+	p := struct {
+		Data []byte `json:"data"`
+	}{}
+	err = json.NewDecoder(resp.Body).Decode(&p)
+	cs.NoError(err)
+	cs.Equal(len(p.Data), len(b))
+}
+
 func (cs *connectedSuite) TestZ_Uninstall() {
 	cs.Run("Uninstalls agent on given deployment", func() {
 		require := cs.Require()
@@ -1332,6 +1359,18 @@ func (ts *telepresenceSuite) applyEchoService(c context.Context, name string) er
 		return fmt.Errorf("failed to create deployment %s: %w", name, err)
 	}
 	err = ts.kubectl(c, "expose", "deploy", name, "--port", "80", "--target-port", "8080")
+	if err != nil {
+		return fmt.Errorf("failed to expose deployment %s: %w", name, err)
+	}
+	return ts.waitForService(c, name, 80)
+}
+
+func (ts *telepresenceSuite) applyHttpbinService(c context.Context, name string) error {
+	err := ts.kubectl(c, "create", "deploy", name, "--image", "kennethreitz/httpbin")
+	if err != nil {
+		return fmt.Errorf("failed to create deployment %s: %w", name, err)
+	}
+	err = ts.kubectl(c, "expose", "deploy", name, "--port", "80")
 	if err != nil {
 		return fmt.Errorf("failed to expose deployment %s: %w", name, err)
 	}
